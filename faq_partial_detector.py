@@ -8,8 +8,6 @@ import re
 import unicodedata
 
 import numpy as np
-from scipy.sparse import csr_matrix
-
 from faq_report_rebuild import context, norm, differences
 
 
@@ -63,6 +61,8 @@ def answer_key(text):
 
 def weighted_matrix(documents, max_df=.20):
     """Return unit TF-IDF rows for unigrams and two-word phrases."""
+    from scipy.sparse import csr_matrix
+
     count = len(documents)
     terms = [Counter([*tokens, *zip(tokens, tokens[1:])]) for tokens in documents]
     frequency = Counter(term for row in terms for term in row)
@@ -82,15 +82,32 @@ def weighted_matrix(documents, max_df=.20):
     return result
 
 
+def embedding_cosines(pairs, dense):
+    scores = [None] * len(pairs)
+    if dense is None:
+        return scores
+    vectors, positions = dense
+    hits = [(k, positions[a], positions[b]) for k, (a, b) in enumerate(pairs)
+            if a in positions and b in positions]
+    if hits:
+        indices, left, right = np.asarray(hits).T
+        values = np.einsum('ij,ij->i', vectors[left], vectors[right]).clip(-1, 1)
+        for index, value in zip(indices, values):
+            scores[index] = float(value)
+    return scores
+
+
 class Corpus:
-    def __init__(self, records):
+    def __init__(self, records, *, lexical=True):
         self.cards = [records[key] for key in sorted(records)]
         self.index = {card.id: i for i, card in enumerate(self.cards)}
         self.form = [answer_key(c.answer) for c in self.cards]
+        self.answer_matrix = self.question_matrix = None
         answers = [words(c.answer) for c in self.cards]
-        questions = [words(c.question) for c in self.cards]
-        self.answer_matrix = weighted_matrix(answers)
-        self.question_matrix = weighted_matrix(questions, max_df=.40)
+        if lexical:
+            questions = [words(c.question) for c in self.cards]
+            self.answer_matrix = weighted_matrix(answers)
+            self.question_matrix = weighted_matrix(questions, max_df=.40)
         counts = Counter(w for tokens in answers for w in set(tokens))
         self.idf = {w: 1 + math.log((1 + len(answers)) / (1 + n)) for w, n in counts.items()}
         self.tokens = [Counter(tokens) for tokens in answers]
@@ -107,22 +124,30 @@ class Corpus:
         if top_k < 1 or block < 1:
             raise ValueError('Размер блока и число соседей должны быть положительными.')
         seen = defaultdict(set)
+        forms = np.asarray(self.form, dtype=object)
 
         def select(row, columns, scores, tag):
             if not columns.size:
                 return
-            eligible = np.array([j != row and self.form[j] != self.form[row] for j in columns])
+            eligible = (columns != row) & (forms[columns] != forms[row])
             same = (self.product[columns] == self.product[row]) & bool(self.product[row])
             for mask in (eligible & same, eligible & ~same):
                 offsets = np.nonzero(mask)[0]
                 if offsets.size > top_k:
+                    border = np.partition(scores[offsets], -top_k)[-top_k]
+                    offsets = offsets[scores[offsets] >= border]
                     order = np.lexsort((columns[offsets], -scores[offsets]))[:top_k]
                     offsets = offsets[order]
                 for other in columns[offsets]:
                     seen[tuple(sorted((row, int(other))))].add(tag)
 
-        for matrix, floor, tag in ((self.answer_matrix, answer_floor, 'ответы'),
-                                   (self.question_matrix, question_floor, 'вопросы')):
+        if self.answer_matrix is None and dense_search_floor is None:
+            raise ValueError('Для поиска E5 нужны готовые векторы и порог поиска соседей.')
+        channels = ((self.answer_matrix, answer_floor, 'ответы'),
+                    (self.question_matrix, question_floor, 'вопросы'))
+        for matrix, floor, tag in channels:
+            if matrix is None:
+                continue
             transpose = matrix.T
             for start in range(0, len(self.cards), block):
                 batch = (matrix[start:start + block] @ transpose).tocsr()
@@ -132,55 +157,55 @@ class Corpus:
                     good = scores >= floor
                     select(start + offset, columns[good], scores[good], tag)
 
-        # Named question overlaps, including alternatives, rescue some paraphrases with low lexical cosine.
-        inverted = defaultdict(list)
-        for row, forms in enumerate(self.question_forms):
-            for form in forms:
-                if len(words(form)) >= 3:
-                    inverted[form].append(row)
-        for rows in inverted.values():
-            if len(rows) > 24:
-                continue
-            for n, i in enumerate(rows):
-                for j in rows[n + 1:]:
-                    if self.form[i] != self.form[j]:
-                        seen[i, j].add('та же формулировка вопроса')
+        if self.question_matrix is not None:
+            # Alternative-question overlaps supplement lexical neighbours only.
+            inverted = defaultdict(list)
+            for row, forms in enumerate(self.question_forms):
+                for form in forms:
+                    if len(words(form)) >= 3:
+                        inverted[form].append(row)
+            for rows in inverted.values():
+                if len(rows) > 24:
+                    continue
+                for n, i in enumerate(rows):
+                    for j in rows[n + 1:]:
+                        if self.form[i] != self.form[j]:
+                            seen[i, j].add('та же формулировка вопроса')
 
         if dense_search_floor is not None:
             if dense is None:
                 raise ValueError('Для поиска соседей E5 нужен проверенный кэш.')
             vectors, positions = dense
-            keys = np.array(sorted(positions))
+            keys = np.array(sorted(positions), dtype=int)
             if keys.size:
                 sample = vectors[[positions[int(i)] for i in keys]]
                 for start in range(0, len(keys), block):
                     scores = sample[start:start + block] @ sample.T
                     for offset, score in enumerate(scores):
+                        row = int(keys[start + offset])
                         keep = score >= dense_search_floor
-                        select(int(keys[start + offset]), keys[keep], score[keep], 'E5')
+                        select(row, keys[keep], score[keep], 'E5')
         return seen
 
     def features(self, pairs, dense=None):
         keys = sorted(pairs)
         for start in range(0, len(keys), 1024):
             batch = keys[start:start + 1024]
-            ai, bi = np.asarray(batch).T
-            score_a = np.asarray(self.answer_matrix[ai].multiply(self.answer_matrix[bi]).sum(axis=1)).ravel()
-            score_q = np.asarray(self.question_matrix[ai].multiply(self.question_matrix[bi]).sum(axis=1)).ravel()
-            for (i, j), a_score, q_score in zip(batch, score_a, score_q):
+            if self.answer_matrix is not None:
+                ai, bi = np.asarray(batch).T
+                score_a = np.asarray(self.answer_matrix[ai].multiply(self.answer_matrix[bi]).sum(axis=1)).ravel()
+                score_q = np.asarray(self.question_matrix[ai].multiply(self.question_matrix[bi]).sum(axis=1)).ravel()
+            else:
+                score_a = score_q = [None] * len(batch)
+            for (i, j), a_score, q_score, dense_score in zip(batch, score_a, score_q, embedding_cosines(batch, dense)):
                 a, b = self.cards[i], self.cards[j]
                 shared = sum(self.idf[w] * n for w, n in (self.tokens[i] & self.tokens[j]).items())
                 cov_a = shared / self.weight[i] if self.weight[i] else 0
                 cov_b = shared / self.weight[j] if self.weight[j] else 0
                 same_question = bool(self.question_forms[i] & self.question_forms[j])
-                dense_score = None
-                if dense is not None:
-                    v, pos = dense
-                    if i in pos and j in pos:
-                        dense_score = float(np.clip(v[pos[i]] @ v[pos[j]], -1, 1))
                 score = {
-                    'a': a.id, 'b': b.id, 'answer': min(1., float(a_score)),
-                    'question': min(1., float(q_score)), 'same_question': same_question,
+                    'a': a.id, 'b': b.id, 'answer': None if a_score is None else min(1., float(a_score)),
+                    'question': None if q_score is None else min(1., float(q_score)), 'same_question': same_question,
                     'cover_a': min(1., cov_a), 'cover_b': min(1., cov_b), 'embedding': dense_score,
                     'literal': min(self.token_count[i], self.token_count[j]) >= 8
                     and (self.token_text[i] in self.token_text[j] or self.token_text[j] in self.token_text[i]),
@@ -281,10 +306,15 @@ def qualify(feature, flags, cut, same_product_only=False):
     return 'приоритетная вычитка', method
 
 
-def load_embedding_cache(path, snapshot, corpus):
+def load_embedding_cache(path, snapshot, corpus, *, expected_dimension=None, require_full_coverage=False):
     """Match row positions from the original run to current cards by ID and answer text."""
     import pandas as pd
 
+    vectors = np.load(path, mmap_mode='r', allow_pickle=False)
+    if vectors.ndim != 2 or vectors.shape[1] < 1 or vectors.dtype.kind != 'f':
+        raise ValueError('Ожидается двумерный массив векторов с плавающей точкой.')
+    if expected_dimension is not None and vectors.shape[1] != expected_dimension:
+        raise ValueError(f'Ожидалось {expected_dimension} признаков в векторе, получено {vectors.shape[1]}.')
     if Path(snapshot).suffix.lower() == '.csv':
         frame = pd.read_csv(snapshot, dtype=str, keep_default_na=False, encoding='utf-8-sig')
     elif Path(snapshot).suffix.lower() == '.pkl':
@@ -295,13 +325,15 @@ def load_embedding_cache(path, snapshot, corpus):
     answers = frame['Ответ'].fillna('').astype(str).str.strip()
     if ids.empty or ids.eq('').any() or ids.duplicated().any() or answers.eq('').any():
         raise ValueError('В снимке кэша пустой ответ или пустой/повторный ID.')
-    vectors = np.load(path, mmap_mode='r', allow_pickle=False)
-    if vectors.ndim != 2 or vectors.shape[0] != len(ids) or vectors.shape[1] < 1 or vectors.dtype.kind != 'f':
-        raise ValueError('Размерность или тип NPY не соответствует снимку.')
+    if vectors.shape[0] != len(ids):
+        raise ValueError('Число строк в NPY и снимке разное.')
     matches = [(i, corpus.index[k]) for i, (k, a) in enumerate(zip(ids, answers))
                if k in corpus.index and corpus.cards[corpus.index[k]].answer.strip() == a]
     if not matches:
         raise ValueError('Ни одного совпадения ID и ответа между выгрузками и снимком.')
+    if require_full_coverage and len(matches) != len(corpus.cards):
+        raise ValueError(f'Совпали ID и ответы у {len(matches)} из {len(corpus.cards)} FAQ. '
+                         'Для полного отчёта нужны векторы для текущей выгрузки.')
     a, b = np.asarray(matches).T
     selected = vectors[a].astype(np.float32)
     lengths = np.linalg.norm(selected, axis=1)

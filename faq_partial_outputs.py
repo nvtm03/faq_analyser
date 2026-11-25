@@ -169,7 +169,8 @@ METRIC_HEADER = ('Раздел', 'Метод', 'Размеченных пар', 
                  'Доля полезных среди найденных', 'Доля найденных среди полезных в выборке')
 
 
-def write_workbook(path, summaries, candidates, differences, audited, exact, metrics, lexical, sweep):
+def write_workbook(path, summaries, candidates, differences, audited, exact, metrics, lexical, sweep,
+                   *, e5=False, pool_counts=()):
     wb = Workbook()
     wb.remove(wb.active)
 
@@ -202,9 +203,15 @@ def write_workbook(path, summaries, candidates, differences, audited, exact, met
     sheet('Сводка', ('Показатель', 'Значение'), summaries, (43, 98))
     sizes = (23, 23, 18, 18, 13, 13, 13, 32, 52, 20, 50, 53,
              34, 34, 24, 24, 24, 24, 47, 47, 65, 65, 26, 24)
-    sheet('Неполные дубли', PAIR_HEADER, map(view_row, candidates), sizes, range(3, 8), 70)
-    sheet('Существенные различия', PAIR_HEADER, map(view_row, differences), sizes, range(3, 8), 58)
-    sheet('Аудит и разметка', PAIR_HEADER, map(view_row, audited), sizes, range(3, 8), 68)
+    columns = [i for i in range(len(PAIR_HEADER)) if not e5 or i not in (2, 3)]
+    header = tuple(PAIR_HEADER[i] for i in columns)
+    widths = tuple(sizes[i] for i in columns)
+    score_cols = tuple(n for n, i in enumerate(columns, 1) if 2 <= i <= 6)
+    for name, rows, height in (('Неполные дубли', candidates, 70),
+                               ('Существенные различия', differences, 58),
+                               ('Аудит и разметка', audited, 68)):
+        values = (tuple(row[i] for i in columns) for row in map(view_row, rows))
+        sheet(name, header, values, widths, score_cols, height)
     sheet('Полные совпадения', EXACT_HEADER, exact, (12, 35, 12, 35, 24, 25, 53, 86), (), 46)
     sheet('Проверка порогов', METRIC_HEADER, metrics, (18, 39, 16, 18, 14, 21, 24, 24), (7, 8))
     if lexical:
@@ -213,16 +220,20 @@ def write_workbook(path, summaries, candidates, differences, audited, exact, met
     if sweep:
         sheet('Пороги E5', ('Порог E5', *METRIC_HEADER), sweep,
               (14, 18, 39, 16, 18, 14, 21, 24, 24), (1, 8, 9))
+    if pool_counts:
+        sheet('Объём по порогам', ('Порог E5', 'Внутри продукта', 'Между продуктами или продукт пуст'),
+              pool_counts, (15, 21, 36), (1,))
     wb.save(path)
 
 
-def write_html(path, summaries, candidates, differences, exact, metrics):
+def write_html(path, summaries, candidates, differences, exact, metrics, *, e5=False):
     def esc(x):
         return escape(str(x), quote=True)
 
     def pair_table(rows):
+        score_header = 'Cosine E5' if e5 else 'Cosine ответа / вопроса'
         out = ['<table><thead><tr><th>Пара и ответы</th><th>Очередь</th>'
-               '<th>Cosine ответа / вопроса</th><th>Покрытие A / B</th><th>Замечания</th></tr></thead><tbody>']
+               f'<th>{score_header}</th><th>Покрытие A / B</th><th>Замечания</th></tr></thead><tbody>']
         for r in rows:
             a, b = r['cards']
             same, _, hard, soft = r['flags']
@@ -230,7 +241,9 @@ def write_html(path, summaries, candidates, differences, exact, metrics):
             ids = esc(a.id + ' · ' + b.id)
             product = esc(' / '.join((a.row['Продукт'] or '—', b.row['Продукт'] or '—')))
             notes = ' · '.join(filter(None, [*hard, *soft, audit.get('comment', '')]))
-            e5 = '' if r['embedding'] is None else f'<br>E5 {r["embedding"]:.3f}'
+            cosine = f'{r["embedding"]:.3f}' if e5 else f'{r["answer"]:.3f} / {r["question"]:.3f}'
+            if not e5 and r['embedding'] is not None:
+                cosine += f'<br>E5 {r["embedding"]:.3f}'
             info = esc(audit.get('decision', ''))
             out.append(
                 f'<tr data-scope="{int(same)}" data-queue="{esc(r["queue"])}"><td><small>{product}</small>'
@@ -238,7 +251,7 @@ def write_html(path, summaries, candidates, differences, exact, metrics):
                 f'<p><small>{ids}</small></p><p><b>Ответ A</b><br>{esc(a.answer)}</p>'
                 f'<p><b>Ответ B</b><br>{esc(b.answer)}</p></details></td>'
                 f'<td>{esc(r["queue"])}<br><small>{info}</small></td>'
-                f'<td>{r["answer"]:.3f} / {r["question"]:.3f}{e5}</td>'
+                f'<td>{cosine}</td>'
                 f'<td>{r["cover_a"]:.3f} / {r["cover_b"]:.3f}</td><td>{esc(notes)}</td></tr>')
         out.append('</tbody></table>')
         return ''.join(out)
@@ -265,7 +278,9 @@ vertical-align:top;border-bottom:1px solid var(--line)}th{background:#e4edf4}td:
 summary{cursor:pointer;font-weight:650}details p{white-space:pre-wrap;max-height:28em;overflow:auto}section{overflow:auto}
 [hidden]{display:none!important}
 </style>""",
-            '<h1>Неполные дубли FAQ ЕЛЧ</h1><p>Совпадения и покрытие ответов для редакторской проверки.</p>',
+            '<h1>Неполные дубли FAQ ЕЛЧ</h1>',
+            '<p>Кандидаты по cosine E5 для редакторской проверки.</p>' if e5 else
+            '<p>Совпадения и покрытие ответов для редакторской проверки.</p>',
             '<nav><button data-tab="candidates" aria-pressed="true">Кандидаты</button>'
             '<button data-tab="differences" aria-pressed="false">Существенные различия</button>'
             '<button data-tab="exact" aria-pressed="false">Полные совпадения</button>'
