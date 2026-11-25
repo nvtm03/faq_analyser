@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+.env
+.DS_Store
+/data/
+/results/
+*.xlsx
+*.xls
+*.npy
+*.pkl
+*.zip
+/faq_partial_benchmark.csv
+/faq_answers_snapshot.csv
+/faq_partial_report.html
