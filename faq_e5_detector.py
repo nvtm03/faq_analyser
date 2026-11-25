@@ -2,22 +2,25 @@
 
 from collections import Counter
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from faq_partial_detector import Corpus, embedding_cosines, load_embedding_cache, risks
-from faq_partial_outputs import (POSITIVE, exact_report, load_benchmark, write_html,
+from faq_partial_outputs import (POSITIVE, exact_report, fingerprint, load_benchmark, write_html,
                                  write_workbook)
 from faq_report_rebuild import read_records
 
 
 E5_SPLITS = ('подбор', 'проверка', 'контрольный аудит')
 E5_GRID = (.75, .80, .85, .88, .90, .92, .94, .96, .98)
-METHODS = {
-    'Cosine E5': (False, False),
-    'E5 и проверки · все продукты': (True, False),
-    'E5 и проверки · внутри продукта': (True, True),
-}
+E5_BASE = 'Cosine E5'
+E5_RULES = 'E5 и проверки · все продукты'
+E5_INSIDE = 'E5 и проверки · внутри продукта'
+E5_COVERAGE = 'E5, проверки и вложенность · все продукты'
+E5_COVERAGE_INSIDE = 'E5, проверки и вложенность · внутри продукта'
+METHODS = (E5_BASE, E5_RULES, E5_INSIDE, E5_COVERAGE, E5_COVERAGE_INSIDE)
+COVERAGE_MARGIN = .02
 
 
 @dataclass
@@ -27,6 +30,33 @@ class E5Run:
     pool: dict
     scores: list
     top_k: int
+
+
+def audit_card_key(ident, content_hash):
+    return sha256(f'{ident}\n{content_hash}'.encode()).hexdigest()
+
+
+def match_saved_audit(corpus, manifest):
+    by_key = {audit_card_key(c.id, fingerprint(c)): i for i, c in enumerate(corpus.cards)}
+    rows = {}
+    for number, (a, b, split, decision) in enumerate(manifest, 1):
+        if a in by_key and b in by_key:
+            key = tuple(sorted((by_key[a], by_key[b])))
+            rows[key] = dict(number=number, split=split, decision=decision,
+                             source='Сохранённый аудит по отпечаткам')
+    return rows, len(manifest) - len(rows)
+
+
+def containment_support(row):
+    return row['literal'] or (max(row['cover_a'], row['cover_b']) >= .93
+                              and (row['same_question'] or min(row['cover_a'], row['cover_b']) >= .65))
+
+
+def effective_cosine(row, method):
+    cosine = row['embedding']
+    if method in (E5_COVERAGE, E5_COVERAGE_INSIDE) and containment_support(row):
+        return min(1., cosine + COVERAGE_MARGIN)
+    return cosine
 
 
 def e5_rows(corpus, keys, pool, benchmark, dense):
@@ -52,13 +82,13 @@ def e5_metrics(rows, cutoff, splits=E5_SPLITS):
                  and r['audit']['decision'] != 'уточнить' and r['embedding'] is not None]
         if not cases:
             continue
-        for method, (apply_risks, same_only) in METHODS.items():
+        for method in METHODS:
             tp = fp = fn = 0
             for row in cases:
                 same, _, hard, _ = row['flags']
-                selected = (bool(row['sources']) and row['embedding'] >= cutoff
-                            and (not apply_risks or not hard)
-                            and (not same_only or same))
+                selected = (bool(row['sources']) and effective_cosine(row, method) >= cutoff
+                            and (method == E5_BASE or not hard)
+                            and (method not in (E5_INSIDE, E5_COVERAGE_INSIDE) or same))
                 positive = row['audit']['decision'] in POSITIVE
                 tp += int(selected and positive)
                 fp += int(selected and not positive)
@@ -75,13 +105,18 @@ def calibrate_e5(rows, same_product_only):
               and r['audit']['decision'] != 'уточнить' and r['embedding'] is not None]
     labels = {r['audit']['decision'] in POSITIVE for r in tuning
               if not same_product_only or r['flags'][0]}
-    cutoffs = sorted({r['embedding'] for r in tuning if r['sources']} | {.75, .80, .85, .90, .95, .98})
+    cutoffs = sorted({effective_cosine(r, method) for r in tuning if r['sources']
+                      for method in (E5_BASE, E5_COVERAGE)} | {.90, .94, .95, .96, .97, .98, .99})
     grid = [(cut, *stats) for cut in cutoffs
             for stats in e5_metrics(tuning, cut, splits=('подбор',))]
-    method = 'E5 и проверки · внутри продукта' if same_product_only else 'E5 и проверки · все продукты'
-    ranked = [(2 * tp / (2 * tp + fp + fn), tp, -fp, cut)
-              for cut, _, variant, _, tp, fp, fn, _, _ in grid if variant == method and tp]
-    return (max(ranked)[-1] if len(labels) == 2 and ranked else None), grid
+    base = E5_INSIDE if same_product_only else E5_RULES
+    coverage = E5_COVERAGE_INSIDE if same_product_only else E5_COVERAGE
+    ranked = [(2 * tp / (2 * tp + fp + fn), tp, -fp, variant == base, cut, variant)
+              for cut, _, variant, _, tp, fp, fn, _, _ in grid if variant in (base, coverage) and tp]
+    if len(labels) == 2 and ranked:
+        _, _, _, _, cut, method = max(ranked)
+        return cut, method, grid
+    return None, base, grid
 
 
 def prepare_e5(exports, embeddings, snapshot, *, top_k=12, block=96, expected_dimension=1024,
@@ -136,28 +171,49 @@ def preview_by_band(scores, limit):
     return preview
 
 
-def export_e5(prepared, output_dir, *, benchmark_file=None, cutoff=None, same_product_only=False,
-              preview_count=100):
+def evaluate_e5(prepared, *, benchmark_file=None, saved_audit=(), cutoff=None, same_product_only=False):
     if cutoff is not None and not -1 <= cutoff <= 1:
         raise ValueError('Порог cosine E5 должен быть от −1 до 1.')
-    if preview_count < 1:
-        raise ValueError('Размер предварительной выборки должен быть положительным.')
     corpus, dense, pool = prepared.corpus, prepared.dense, prepared.pool
-    benchmark, stale = load_benchmark(benchmark_file, corpus)
+    benchmark, missed_audit = match_saved_audit(corpus, saved_audit) if saved_audit else ({}, 0)
+    external, stale = load_benchmark(benchmark_file, corpus)
+    benchmark.update(external)
     eligible_labels = {key: value for key, value in benchmark.items()
                        if corpus.form[key[0]] != corpus.form[key[1]]
                        and all(index in dense[1] for index in key)}
     audited = list(e5_rows(corpus, eligible_labels, pool, benchmark, dense))
-    calibrated, grid = calibrate_e5(audited, same_product_only)
+    calibrated, policy, grid = calibrate_e5(audited, same_product_only)
     selected_cutoff = cutoff if cutoff is not None else calibrated
     metrics = e5_metrics(audited, selected_cutoff) if selected_cutoff is not None else []
+    return dict(benchmark=benchmark, stale=stale, missed_audit=missed_audit, audited=audited,
+                cutoff=selected_cutoff, policy=policy, grid=grid, metrics=metrics)
 
+
+def export_e5(prepared, output_dir, *, benchmark_file=None, saved_audit=(), cutoff=None,
+              same_product_only=False, preview_count=100):
+    if preview_count < 1:
+        raise ValueError('Размер предварительной выборки должен быть положительным.')
+    corpus, dense, pool = prepared.corpus, prepared.dense, prepared.pool
+    result = evaluate_e5(prepared, benchmark_file=benchmark_file, saved_audit=saved_audit,
+                         cutoff=cutoff, same_product_only=same_product_only)
+    benchmark, audited = result['benchmark'], result['audited']
+    selected_cutoff, policy = result['cutoff'], result['policy']
+    metrics, grid = result['metrics'], result['grid']
+
+    coverage_enabled = policy in (E5_COVERAGE, E5_COVERAGE_INSIDE)
+    floor = (selected_cutoff - COVERAGE_MARGIN if coverage_enabled and selected_cutoff is not None
+             else selected_cutoff)
     scores = [(score, pair) for score, pair in prepared.scores
               if (not same_product_only or product_match(corpus, pair))
-              and (selected_cutoff is None or score >= selected_cutoff)]
+              and (floor is None or score >= floor)]
     if selected_cutoff is None:
         scores = preview_by_band(scores, preview_count)
     rows = list(e5_rows(corpus, dict.fromkeys(pair for _, pair in scores), pool, benchmark, dense))
+    if coverage_enabled and selected_cutoff is not None:
+        rows = [r for r in rows if effective_cosine(r, policy) >= selected_cutoff]
+        for row in rows:
+            if row['embedding'] < selected_cutoff:
+                row['signals'] = 'Cosine E5 + вложенность'
     for row in rows:
         if row['audit'].get('decision') in ('разные', 'конфликт'):
             row['queue'] = 'существенное различие'
@@ -174,14 +230,16 @@ def export_e5(prepared, output_dir, *, benchmark_file=None, cutoff=None, same_pr
         ('Карточек без совпавшего вектора', len(corpus.cards) - len(dense[1])),
         ('Лимит соседей на карточку и тип продукта', prepared.top_k),
         ('Пар в пуле соседей E5', len(pool)),
-        ('Порог cosine E5', selected_cutoff),
+        ('Базовый порог cosine E5', selected_cutoff),
+        ('Правило отбора', policy),
         ('Статус порога', status),
         ('Приоритетная вычитка', counts['приоритетная вычитка']),
         ('Сверка контекста', counts['сверка контекста']),
         ('Существенные различия', counts['существенное различие']),
         ('Кандидаты между продуктами', sum(not r['flags'][0] and r['queue'] != 'существенное различие' for r in rows)),
         ('Пар разметки с актуальным текстом', len(audited)),
-        ('Устаревших пар разметки', stale),
+        ('Пар аудита без совпадения отпечатков', result['missed_audit']),
+        ('Устаревших пар разметки', result['stale']),
         ('Покрытие A и B', 'Доля общих взвешенных слов, дополнительный признак для проверки пары.'),
         ('Границы оценки', 'Метрики относятся к размеченной выборке и заданному лимиту соседей.'),
     ]

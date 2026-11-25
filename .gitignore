@@ -14,3 +14,6 @@ __pycache__/
 /faq_partial_benchmark.csv
 /faq_answers_snapshot.csv
 /faq_partial_report.html
+
+# Локальная разметка для калибровки
+/faq_e5_audit.json
